@@ -1,0 +1,45 @@
+
+---
+
+savepath : user_has_not_defined
+
+# ECG signal present?
+gating : 1
+
+# record or just visualize data?
+record : 0
+record_poses: 0
+save_replay_data: 1
+
+# SDF parameters
+tsdf_map : 1
+voxel_size : 0.0025
+
+# segmentation parameters
+
+hybrid_seg: 0 # deterministic segmentation
+conf_threshold: 0.92  
+deeplumen_on : 1
+
+# deeplumen trained weights
+model_path: deeplumen_model/weights.weights.h5  
+
+
+# mapping visualization parameters
+
+vpC_map: 1 # volumetric point cloud
+bpC_map: 0 # boundary point cloud
+extend: 0 # visualize whole point cloud or current imaged point cloud
+orifice_center_map: 1 # branch centroid extraction visualization
+figure_mapping: 1 # match paper figure format
+
+
+# double_display: 1
+double_display: 1 # single or double monitor
+
+
+
+
+
+
+
