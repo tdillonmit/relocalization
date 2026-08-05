@@ -75,9 +75,14 @@ class PointCloudUpdater:
 
         self.relocalization=1
 
-        self.write_folder = str(
-            self._resolve_dataset_root(Path(dataset_path))
-        )
+        # self.write_folder = str(
+        #     self._resolve_dataset_root(Path(dataset_path))
+        # )
+
+        print("dataset_path:", dataset_path)
+        self.write_folder = "/home/tdillon/datasets/" + str(dataset_path)
+
+
         self.config_path = Path(config_path).expanduser().resolve()
         self.model_path_override = (
             Path(model_path).expanduser().resolve()
@@ -710,7 +715,7 @@ class PointCloudUpdater:
             TEM_C = np.asarray(TEM_C)
 
             self.sim = VesselUltrasoundSimulator(
-            self.write_folder, self.registered_ct_mesh , image_size=224, fov_mm=self.scaling * 224)
+            self.write_folder, self.registered_ct_mesh , image_size=224, fov_mm=self.scaling * 224 * (781/224))
 
         for i, (grayscale_image, TW_EM) in enumerate(
             zip(grayscale_images, em_transforms)
@@ -722,6 +727,8 @@ class PointCloudUpdater:
 
             if(self.relocalization==1):
                 self.sim_mask_1, self.sim_mask_2 = self.sim.simulate_segmentation(TW_EM @ TEM_C)
+                self.sim_mask_1 = cv2.flip(self.sim_mask_1, 0)
+                self.sim_mask_2 = cv2.flip(self.sim_mask_2, 0)
 
             self.append_image_transform_pair(TW_EM, grayscale_image)
             time.sleep(0.030)
@@ -1006,6 +1013,7 @@ class PointCloudUpdater:
         sim_mask_2_bin = (sim_mask_2_send > 0).astype(np.uint8)
         overlay_sim[sim_mask_1_bin == 1] = (0, 0, 255)
         overlay_sim[sim_mask_2_bin == 1] = (255, 0, 0)
+        
         cv2.imshow("simulated image", overlay_sim)
         cv2.waitKey(1)
 
@@ -1707,11 +1715,14 @@ def main():
             raise ValueError(
                 "--force-download can only be used with --dataset-name."
             )
-        dataset_path = args.dataset_path.expanduser().resolve()
-        if not dataset_path.is_dir():
-            raise FileNotFoundError(
-                f"Dataset directory does not exist: {dataset_path}"
-            )
+
+        dataset_path = args.dataset_path
+
+        # dataset_path = args.dataset_path.expanduser().resolve()
+        # if not dataset_path.is_dir():
+        #     raise FileNotFoundError(
+        #         f"Dataset directory does not exist: {dataset_path}"
+        #     )
     elif args.no_download:
         dataset_path = (args.data_root / args.dataset_name).expanduser().resolve()
         if not _dataset_layout_exists(dataset_path):

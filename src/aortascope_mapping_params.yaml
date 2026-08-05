@@ -22,7 +22,7 @@ conf_threshold: 0.92
 deeplumen_on : 1
 
 # deeplumen trained weights
-model_path: deeplumen_model/weights.weights.h5  
+model_path: /home/tdillon/relocalization/deeplumen_model/weights.weights.h5  
 
 
 # mapping visualization parameters

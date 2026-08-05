@@ -85,7 +85,7 @@ class VesselUltrasoundSimulator:
         min_component_area_px=6,
     ):
 
-
+        
         if not o3d_mesh.is_watertight:
             raise ValueError(
                 f"Mesh at {mesh_path} is not watertight after cleanup; "
@@ -93,7 +93,7 @@ class VesselUltrasoundSimulator:
             )
 
         o3d_mesh.compute_vertex_normals()
-        o3d.visualization.draw_geometries([o3d_mesh])
+        # o3d.visualization.draw_geometries([o3d_mesh])
 
         
 
