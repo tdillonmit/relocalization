@@ -273,3 +273,4 @@ def get_single_point_cloud_from_pixels(pixels, scaling):
     return np.hstack(
         (np.zeros((two_d_points.shape[0], 1)), two_d_points)
     )
+

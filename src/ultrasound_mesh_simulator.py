@@ -159,6 +159,8 @@ class VesselUltrasoundSimulator:
 
         node_pool_distance = 0.008
 
+        
+
         no_branch_mesh = o3d.io.read_triangle_mesh(mesh_path+ "/no_branch_mesh.ply")
         if no_branch_mesh.is_empty():
             self.legacy_mesh = remove_branch_from_mesh_poisson(o3d_mesh, relevant_side_branch_centrelines_pc_points, node_pool_distance)
@@ -404,6 +406,12 @@ class VesselUltrasoundSimulator:
                 if largest.sum() >= self.min_component_area_px:
                     mask_2 = (largest * 255).astype(np.uint8)
 
+                    # A branch that never touches the lumen in this slice
+                    # isn't a real ostium in view -- drop it.
+                    dilated_mask_1 = cv2.dilate(mask_1, np.ones((3, 3), np.uint8))
+                    if not np.any((dilated_mask_1 > 0) & (mask_2 > 0)):
+                        mask_2 = np.zeros((size, size), dtype=np.uint8)
+
         if noise is not None and noise.dilate_px > 0:
             kernel = np.ones((noise.dilate_px, noise.dilate_px), np.uint8)
             mask_1 = cv2.dilate(mask_1, kernel)
@@ -565,6 +573,296 @@ class VesselUltrasoundSimulator:
                 if elapsed_ms >= wait_ms:
                     return -1, True
 
+
+
+
+
+def get_weighted_image_correlation_score(
+    mask_1,
+    mask_2,
+    sim_image_mask_1,
+    sim_image_mask_2,
+    sigma_b=50.0,
+    lumen_weight = 0.20,
+    branch_weight= 0.40,
+    centroid_weight= 0.25,
+    direction_weight = 0.15,
+    return_components=False,
+):
+    """
+    Compute a four-term correlation score between observed and simulated masks.
+
+    Parameters
+    ----------
+    mask_1
+        Observed lumen mask.
+    mask_2
+        Observed branch mask.
+    sim_image_mask_1
+        Simulated lumen mask.
+    sim_image_mask_2
+        Simulated branch mask.
+    sigma_b
+        Spatial tolerance for branch-centroid displacement, in pixels.
+
+        If centroid_distance == sigma_b, the centroid score is exp(-0.5),
+        approximately 0.607.
+
+    lumen_weight
+        Weight assigned to lumen Dice.
+    branch_weight
+        Weight assigned to branch Dice.
+    centroid_weight
+        Weight assigned to branch-centroid proximity.
+    direction_weight
+        Weight assigned to lumen-to-branch direction agreement.
+    return_components
+        If True, also return the individual metrics and centroids.
+
+    Returns
+    -------
+    score
+        Weighted score in [0, 1].
+
+    components
+        Returned only when return_components=True.
+    """
+
+    if sigma_b <= 0:
+        raise ValueError("sigma_b must be greater than zero.")
+
+    # Convert all nonzero pixels to foreground.
+    obs_lumen = np.asarray(mask_1) > 0
+    obs_branch = np.asarray(mask_2) > 0
+    sim_lumen = np.asarray(sim_image_mask_1) > 0
+    sim_branch = np.asarray(sim_image_mask_2) > 0
+
+    expected_shape = obs_lumen.shape
+    masks = {
+        "mask_2": obs_branch,
+        "sim_image_mask_1": sim_lumen,
+        "sim_image_mask_2": sim_branch,
+    }
+
+    if obs_lumen.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D masks, but mask_1 has shape {obs_lumen.shape}."
+        )
+
+    for name, mask in masks.items():
+        if mask.shape != expected_shape:
+            raise ValueError(
+                f"All masks must have the same shape. "
+                f"mask_1 has shape {expected_shape}, while "
+                f"{name} has shape {mask.shape}."
+            )
+
+    weights = {
+        "lumen_dice": float(lumen_weight),
+        "branch_dice": float(branch_weight),
+        "centroid_score": float(centroid_weight),
+        "direction_score": float(direction_weight),
+    }
+
+    if any(weight < 0 for weight in weights.values()):
+        raise ValueError("All component weights must be nonnegative.")
+
+    if sum(weights.values()) <= 0:
+        raise ValueError("At least one component weight must be positive.")
+
+    def centroid(binary_mask: np.ndarray):
+        """
+        Return the mask centroid as [x, y].
+
+        np.argwhere returns coordinates as [row, column] = [y, x],
+        so the order is explicitly reversed here.
+        """
+        coordinates_yx = np.argwhere(binary_mask)
+
+        if coordinates_yx.size == 0:
+            return None
+
+        mean_y, mean_x = coordinates_yx.mean(axis=0)
+        return np.array([mean_x, mean_y], dtype=np.float64)
+
+    def dice_score(
+        first_mask: np.ndarray,
+        second_mask: np.ndarray,
+    ):
+        """
+        Return binary Dice.
+
+        Returns None when both masks are empty because that class provides
+        no localization information. If only one mask is empty, returns 0.
+        """
+        first_size = int(np.count_nonzero(first_mask))
+        second_size = int(np.count_nonzero(second_mask))
+
+        if first_size == 0 and second_size == 0:
+            return None
+
+        if first_size == 0 or second_size == 0:
+            return 0.0
+
+        intersection = int(np.count_nonzero(first_mask & second_mask))
+
+        return float(
+            2.0 * intersection / (first_size + second_size)
+        )
+
+    # ------------------------------------------------------------------
+    # 1. Lumen overlap
+    # ------------------------------------------------------------------
+    lumen_dice = dice_score(obs_lumen, sim_lumen)
+
+    # ------------------------------------------------------------------
+    # 2. Branch overlap
+    # ------------------------------------------------------------------
+    branch_dice = dice_score(obs_branch, sim_branch)
+
+    # Compute all centroids.
+    observed_lumen_centroid = centroid(obs_lumen)
+    observed_branch_centroid = centroid(obs_branch)
+    simulated_lumen_centroid = centroid(sim_lumen)
+    simulated_branch_centroid = centroid(sim_branch)
+
+    observed_has_branch = observed_branch_centroid is not None
+    simulated_has_branch = simulated_branch_centroid is not None
+
+    # ------------------------------------------------------------------
+    # 3. Branch-centroid proximity
+    # ------------------------------------------------------------------
+    branch_centroid_distance: float | None
+
+    if observed_has_branch and simulated_has_branch:
+        branch_centroid_distance = float(
+            np.linalg.norm(
+                observed_branch_centroid - simulated_branch_centroid
+            )
+        )
+
+        centroid_score = float(
+            np.exp(
+                -(branch_centroid_distance ** 2)
+                / (2.0 * sigma_b ** 2)
+            )
+        )
+
+    elif observed_has_branch != simulated_has_branch:
+        # One image predicts a branch and the other does not.
+        branch_centroid_distance = float("inf")
+        centroid_score = 0.0
+
+    else:
+        # Neither image contains a branch, so this term is uninformative.
+        branch_centroid_distance = None
+        centroid_score = None
+
+    # ------------------------------------------------------------------
+    # 4. Lumen-to-branch direction agreement
+    # ------------------------------------------------------------------
+    direction_cosine: float | None
+
+    if observed_has_branch and simulated_has_branch:
+        required_centroids = (
+            observed_lumen_centroid,
+            observed_branch_centroid,
+            simulated_lumen_centroid,
+            simulated_branch_centroid,
+        )
+
+        if any(value is None for value in required_centroids):
+            direction_cosine = None
+            direction_score = 0.0
+        else:
+            observed_direction = (
+                observed_branch_centroid - observed_lumen_centroid
+            )
+            simulated_direction = (
+                simulated_branch_centroid - simulated_lumen_centroid
+            )
+
+            observed_norm = float(np.linalg.norm(observed_direction))
+            simulated_norm = float(np.linalg.norm(simulated_direction))
+
+            if observed_norm < 1e-12 or simulated_norm < 1e-12:
+                direction_cosine = None
+                direction_score = 0.0
+            else:
+                direction_cosine = float(
+                    np.dot(observed_direction, simulated_direction)
+                    / (observed_norm * simulated_norm)
+                )
+
+                # Protect against small floating-point errors.
+                direction_cosine = float(
+                    np.clip(direction_cosine, -1.0, 1.0)
+                )
+
+                # Same direction -> 1
+                # Orthogonal or opposite direction -> 0
+                direction_score = max(0.0, direction_cosine)
+
+                # An alternative mapping that distinguishes opposite from
+                # orthogonal directions is:
+                #
+                # direction_score = (direction_cosine + 1.0) / 2.0
+                #
+                # However, that gives an orthogonal direction a score of 0.5.
+
+    elif observed_has_branch != simulated_has_branch:
+        direction_cosine = None
+        direction_score = 0.0
+
+    else:
+        direction_cosine = None
+        direction_score = None
+
+    component_scores = {
+        "lumen_dice": lumen_dice,
+        "branch_dice": branch_dice,
+        "centroid_score": centroid_score,
+        "direction_score": direction_score,
+    }
+
+    # Omit terms that are uninformative because the relevant class is
+    # absent from both observed and simulated images.
+    active_weight_sum = sum(
+        weights[name]
+        for name, component_score in component_scores.items()
+        if component_score is not None
+    )
+
+    if active_weight_sum <= 0:
+        score = 0.0
+    else:
+        score = sum(
+            weights[name] * component_score
+            for name, component_score in component_scores.items()
+            if component_score is not None
+        ) / active_weight_sum
+
+    score = float(np.clip(score, 0.0, 1.0))
+
+    if not return_components:
+        return score
+
+    components = {
+        "score": score,
+        "lumen_dice": lumen_dice,
+        "branch_dice": branch_dice,
+        "branch_centroid_distance_pixels": branch_centroid_distance,
+        "centroid_score": centroid_score,
+        "direction_cosine": direction_cosine,
+        "direction_score": direction_score,
+        "observed_lumen_centroid_xy": observed_lumen_centroid,
+        "observed_branch_centroid_xy": observed_branch_centroid,
+        "simulated_lumen_centroid_xy": simulated_lumen_centroid,
+        "simulated_branch_centroid_xy": simulated_branch_centroid,
+        "weights": weights,
+    }
+
+    return score, components
 
 def pose_from_position_forward(position, forward, roll=0.0):
     """Build a 4x4 pose from a position, a forward (probe/x) axis, and a roll angle."""
@@ -1001,3 +1299,141 @@ def get_all_nodes_inside_radius(centroids, radius, mesh):
     result = np.array(combined_list)
 
     return result
+
+def fix_mesh_poisson(mesh_cut, poisson_depth=10,
+    poisson_scale=1.1):
+
+    original_vertex_count = len(mesh_cut.vertices)
+    original_triangle_count = len(mesh_cut.triangles)
+
+    if original_vertex_count == 0 or original_triangle_count == 0:
+        raise ValueError("The input mesh is empty.")
+
+    # Use the original mesh vertex count as the Poisson point count.
+    number_of_points = original_vertex_count
+
+    point_cloud = mesh_cut.sample_points_poisson_disk(
+        number_of_points=number_of_points,
+        init_factor=5,
+        use_triangle_normal=False,
+    )
+
+  
+
+    if not point_cloud.has_normals():
+        # Normally the sampled mesh normals are transferred automatically,
+        # but estimate them as a fallback.
+        nearest_neighbor_distance = np.mean(
+            point_cloud.compute_nearest_neighbor_distance()
+        )
+
+        normal_radius = max(
+            3.0 * nearest_neighbor_distance,
+            np.finfo(float).eps,
+        )
+
+        point_cloud.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=normal_radius,
+                max_nn=50,
+            )
+        )
+
+        point_cloud.orient_normals_consistent_tangent_plane(
+            k=min(50, max(3, len(point_cloud.points) - 1))
+        )
+
+    point_cloud.normalize_normals()
+
+    print(
+        f"Sampled point cloud: {len(point_cloud.points)} points"
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Poisson surface reconstruction
+    # ------------------------------------------------------------------
+
+    poisson_mesh, densities = (
+        o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            point_cloud,
+            depth=int(poisson_depth),
+            scale=float(poisson_scale),
+            linear_fit=False,
+            n_threads=-1,
+        )
+    )
+
+    return poisson_mesh
+
+def erode_connected_masks(
+    mask_1,
+    mask_2,
+    erosion_pixels=3,
+):
+   
+
+    mask_1_binary = np.asarray(mask_1) > 0
+    mask_2_binary = np.asarray(mask_2) > 0
+
+    if mask_1_binary.shape != mask_2_binary.shape:
+        raise ValueError(
+            "mask_1 and mask_2 must have the same shape. "
+            f"Received {mask_1_binary.shape} and {mask_2_binary.shape}."
+        )
+
+    if mask_1_binary.ndim != 2:
+        raise ValueError("mask_1 and mask_2 must be 2-D arrays.")
+
+    if erosion_pixels < 0:
+        raise ValueError("erosion_pixels must be nonnegative.")
+
+    # Form one connected semantic object.
+    combined_mask = mask_1_binary | mask_2_binary
+
+    if erosion_pixels == 0:
+        eroded_combined = combined_mask
+    else:
+        kernel_size = 2 * erosion_pixels + 1
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+
+        # Erosion is determined exclusively from the exterior boundary
+        # of the combined lumen-plus-branch object.
+        eroded_combined = cv2.erode(
+            combined_mask.astype(np.uint8),
+            kernel,
+            iterations=1,
+        ) > 0
+
+    # Apply the same combined erosion result to each original class.
+    # The internal lumen/branch boundary is not independently eroded.
+    eroded_mask_1 = mask_1_binary & eroded_combined
+    eroded_mask_2 = mask_2_binary & eroded_combined
+
+
+    mask_1_eroded= cv2.erode(
+            mask_1_binary.astype(np.uint8),
+            kernel,
+            iterations=1,
+        ) > 0
+
+
+    mask_1_ring = mask_1_binary & ~mask_1_eroded
+    mask_1_bit = mask_1_ring & eroded_combined
+    # cv2.imshow("mask_1_ring", mask_1_ring.astype(np.uint8) * 255)
+    # cv2.imshow("mask_1_bit", mask_1_bit.astype(np.uint8) * 255)
+    eroded_mask_2 = eroded_mask_2 | mask_1_bit
+    eroded_mask_1 = eroded_mask_1 & ~mask_1_bit
+    
+
+    
+
+
+    return (
+        eroded_mask_1.astype(np.uint8),
+        eroded_mask_2.astype(np.uint8),
+        
+    )

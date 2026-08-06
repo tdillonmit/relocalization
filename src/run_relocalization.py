@@ -1,5 +1,6 @@
 #!/usr/bin/env python3.9
 
+import os
 import cv2
 import open3d as o3d
 import numpy as np
@@ -14,6 +15,8 @@ import shutil
 import zipfile
 import argparse
 from pathlib import Path
+from typing import Any
+from numpy.typing import ArrayLike
 
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -710,12 +713,31 @@ class PointCloudUpdater:
         print("number of loaded images:", len(grayscale_images))
 
         if(self.relocalization==1):
+            
+         
+            self.vis.get_render_option().mesh_show_back_face = False
             self.load_registetered_ct()
+            triangles = np.asarray(self.registered_ct_mesh.triangles)
+            self.registered_ct_mesh.triangles = o3d.utility.Vector3iVector(triangles[:, ::-1])
+            self.registered_ct_mesh.compute_vertex_normals()
+            # fix the original mesh
+            fixed_branch_mesh = o3d.io.read_triangle_mesh(self.write_folder+ "/fixed_branch_mesh.ply")
+            if fixed_branch_mesh.is_empty():
+                self.registered_ct_mesh = fix_mesh_poisson(o3d_mesh)
+                o3d.io.write_triangle_mesh(self.write_folder+ "/fixed_branch_mesh.ply", self.registered_ct_mesh)
+            else:
+                self.registered_ct_mesh = fixed_branch_mesh
+
             TEM_C = [[1,0,0,self.translation],[0,np.cos(self.angle),-np.sin(self.angle),self.radial_offset*np.cos(self.o_clock)],[0,np.sin(self.angle),np.cos(self.angle),self.radial_offset*np.sin(self.o_clock)],[0, 0, 0, 1]]  
             TEM_C = np.asarray(TEM_C)
 
             self.sim = VesselUltrasoundSimulator(
             self.write_folder, self.registered_ct_mesh , image_size=224, fov_mm=self.scaling * 224 * (781/224))
+
+            self.section_pcd = o3d.geometry.PointCloud()
+            self.vis.add_geometry(self.section_pcd)
+
+            
 
         for i, (grayscale_image, TW_EM) in enumerate(
             zip(grayscale_images, em_transforms)
@@ -727,8 +749,22 @@ class PointCloudUpdater:
 
             if(self.relocalization==1):
                 self.sim_mask_1, self.sim_mask_2 = self.sim.simulate_segmentation(TW_EM @ TEM_C)
+
+
+                new_section_pcd = self.sim.cross_section_point_cloud(
+                    TW_EM @ TEM_C, self.sim_mask_1, self.sim_mask_2
+                    )
+                self.section_pcd.points = new_section_pcd.points
+                self.section_pcd.colors = new_section_pcd.colors
+                self.vis.update_geometry(self.section_pcd)
+
                 self.sim_mask_1 = cv2.flip(self.sim_mask_1, 0)
                 self.sim_mask_2 = cv2.flip(self.sim_mask_2, 0)
+
+                self.sim_mask_1, self.sim_mask_2 = erode_connected_masks(self.sim_mask_1, self.sim_mask_2, 6)
+
+                
+                
 
             self.append_image_transform_pair(TW_EM, grayscale_image)
             time.sleep(0.030)
@@ -1013,9 +1049,49 @@ class PointCloudUpdater:
         sim_mask_2_bin = (sim_mask_2_send > 0).astype(np.uint8)
         overlay_sim[sim_mask_1_bin == 1] = (0, 0, 255)
         overlay_sim[sim_mask_2_bin == 1] = (255, 0, 0)
+
+        
         
         cv2.imshow("simulated image", overlay_sim)
         cv2.waitKey(1)
+
+        # --- IMAGE CORRELATION SCORE CALCULATION ---- #
+        score, details = get_weighted_image_correlation_score(
+            mask_1=mask_1,
+            mask_2=mask_2,
+            sim_image_mask_1=self.sim_mask_1,
+            sim_image_mask_2=self.sim_mask_2,
+            sigma_b=50,
+            return_components=True,
+        )
+
+        print("Overall score:", score)
+        print("Lumen Dice:", details["lumen_dice"])
+        print("Branch Dice:", details["branch_dice"])
+        print(
+            "Branch centroid distance:",
+            details["branch_centroid_distance_pixels"],
+        )
+        print("Centroid score:", details["centroid_score"])
+        print("Direction cosine:", details["direction_cosine"])
+        print("Direction score:", details["direction_score"])
+
+
+        # cv2.waitKey(0)
+
+        # ---- TEMP VERIFICATION: confirm no detached branch masks remain ---- #
+        if os.environ.get("DEBUG_SIM_BRANCH") == "1" and sim_mask_2_bin.any():
+            if not hasattr(self, "_debug_frame_idx"):
+                self._debug_frame_idx = 0
+                os.makedirs("outputs/debug_sim_branch", exist_ok=True)
+            self._debug_frame_idx += 1
+            dilated_lumen = cv2.dilate(sim_mask_1_bin, np.ones((5, 5), np.uint8))
+            touching = bool((dilated_lumen & sim_mask_2_bin).any())
+            tag = "touching" if touching else "detached"
+            cv2.imwrite(
+                f"outputs/debug_sim_branch/f{self._debug_frame_idx:04d}_{tag}.png",
+                np.hstack([original_image, overlay_sim]),
+            )
 
         
         
