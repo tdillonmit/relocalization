@@ -960,7 +960,8 @@ class PointCloudUpdater:
                 conf_class2 = conf_class2.numpy()
                 raw_data = pred[0].numpy()
 
-
+                end_time = time.time()
+                print("segmentation time:", end_time-start_time)
 
                 
 
